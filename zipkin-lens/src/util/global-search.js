@@ -1,21 +1,5 @@
 import { buildQueryParameters } from './api';
 
-export const orderedConditionKeyList = [
-  'serviceName',
-  'spanName',
-  'minDuration',
-  'maxDuration',
-  'annotationQuery',
-];
-
-export const defaultConditionValues = {
-  serviceName: 'all',
-  spanName: 'all',
-  minDuration: 10,
-  maxDuration: 100,
-  annotationQuery: 'error',
-};
-
 export const lookbackDurations = {
   '1h': 3600000,
   '2h': 7200000,
@@ -26,37 +10,87 @@ export const lookbackDurations = {
   '7d': 604800000,
 };
 
+export const orderedConditionKeyList = autocompleteKeys => ([
+  'serviceName',
+  'spanName',
+  'minDuration',
+  'maxDuration',
+  ...autocompleteKeys,
+  'tags',
+]);
+
+export const isAutocompleteKey = (conditionKey) => {
+  switch (conditionKey) {
+    case 'serviceName':
+    case 'spanName':
+    case 'minDuration':
+    case 'maxDuration':
+    case 'tags':
+      return false;
+    default:
+      return true;
+  }
+};
+
+export const defaultConditionValues = (conditionKey) => {
+  switch (conditionKey) {
+    case 'serviceName':
+      return undefined;
+    case 'spanName':
+      return undefined;
+    case 'minDuration':
+      return 10;
+    case 'maxDuration':
+      return 100;
+    case 'tags':
+      return '';
+    default: // autocompleteKeys
+      return undefined;
+  }
+};
+
 // Returns a key of search condition to be generated next.
-export const nextInitialConditionKey = (conditions) => {
+export const nextInitialConditionKey = (conditions, autocompleteKeys) => {
+  const conditionKeyList = orderedConditionKeyList(autocompleteKeys);
   const existingConditionsMemo = {};
   conditions.forEach((condition) => {
     existingConditionsMemo[condition.key] = true;
   });
 
-  for (let i = 0; i < orderedConditionKeyList.length; i += 1) {
-    const conditionKey = orderedConditionKeyList[i];
+  for (let i = 0; i < conditionKeyList.length; i += 1) {
+    const conditionKey = conditionKeyList[i];
     if (!existingConditionsMemo[conditionKey]) {
       return conditionKey;
     }
   }
-  return 'annotationQuery';
+  return 'tags';
 };
 
 export const buildQueryParametersWithConditions = (
   conditions, lookbackCondition, limitCondition,
 ) => {
-  const annotationQueryConditions = [];
+  const tagsConditions = [];
+  const autocompleteTags = [];
   const conditionMap = {};
 
   conditions.forEach((condition) => {
-    if (condition.key === 'annotationQuery') {
-      annotationQueryConditions.push(condition.value);
-    } else {
-      conditionMap[condition.key] = condition.value;
+    switch (condition.key) {
+      case 'serviceName':
+      case 'spanName':
+      case 'minDuration':
+      case 'maxDuration':
+        conditionMap[condition.key] = condition.value;
+        break;
+      case 'tags':
+        tagsConditions.push(condition.value);
+        break;
+      default: // autocompleteTags
+        autocompleteTags.push(`${condition.key}=${condition.value}`);
+        break;
     }
   });
-  conditionMap.annotationQuery = annotationQueryConditions.join(' and ');
-
+  conditionMap.tags = tagsConditions.join(' and ');
+  conditionMap.autocompleteTags = autocompleteTags.join(' and ');
   conditionMap.limit = limitCondition;
   conditionMap.lookback = lookbackCondition.value;
   conditionMap.endTs = lookbackCondition.endTs;
@@ -71,6 +105,7 @@ export const buildQueryParametersWithConditions = (
 // trace page URL.
 export const buildApiQueryParameters = (queryParameters) => {
   const result = {};
+  let tags;
   Object.keys(queryParameters).forEach((conditionKey) => {
     const conditionValue = queryParameters[conditionKey];
     switch (conditionKey) {
@@ -78,9 +113,22 @@ export const buildApiQueryParameters = (queryParameters) => {
       case 'spanName':
       case 'minDuration':
       case 'maxDuration':
-      case 'annotationQuery':
       case 'limit':
         result[conditionKey] = conditionValue;
+        break;
+      case 'tags':
+        if (typeof tags === 'undefined') {
+          tags = conditionValue;
+        } else {
+          tags = tags.concat(' and ', conditionValue);
+        }
+        break;
+      case 'autocompleteTags':
+        if (typeof tags === 'undefined') {
+          tags = conditionValue;
+        } else {
+          tags = tags.concat(' and ', conditionValue);
+        }
         break;
       case 'lookback':
         switch (conditionValue) {
@@ -108,6 +156,8 @@ export const buildApiQueryParameters = (queryParameters) => {
         break;
     }
   });
+  // In zipkin-server, annotationQuery is used as a name.
+  result.annotationQuery = tags;
   return result;
 };
 
@@ -133,11 +183,20 @@ export const extractConditionsFromQueryParameters = (queryParameters) => {
           value: parseInt(conditionValue, 10),
         });
         break;
-      case 'annotationQuery':
-        conditionValue.split(' and ').forEach((annotationQuery) => {
+      case 'tags':
+        conditionValue.split(' and ').forEach((tags) => {
           conditions.push({
-            key: conditionKey,
-            value: annotationQuery,
+            key: 'tags',
+            value: tags,
+          });
+        });
+        break;
+      case 'autocompleteTags':
+        conditionValue.split(' and ').forEach((autocompleteTag) => {
+          const splitted = autocompleteTag.split('=');
+          conditions.push({
+            key: splitted[0],
+            value: splitted[1],
           });
         });
         break;
@@ -171,4 +230,45 @@ export const extractConditionsFromQueryParameters = (queryParameters) => {
     }
   });
   return { conditions, lookbackCondition, limitCondition };
+};
+
+// Make the availability of the already specified conditions being false,
+// the condition not specified yet being true.
+export const getConditionKeyListWithAvailability = (
+  currentConditionKey, conditions, autocompleteKeys,
+) => {
+  const existingConditionsMemo = {};
+
+  // Memo the keys which is already used.
+  conditions.forEach((condition) => {
+    if (condition.key === 'tags') {
+      return;
+    }
+    existingConditionsMemo[condition.key] = true;
+  });
+
+  const conditionKeyList = orderedConditionKeyList(autocompleteKeys);
+  const result = [];
+  for (let i = 0; i < conditionKeyList.length; i += 1) {
+    const conditionKey = conditionKeyList[i];
+
+    // The currently focused conditionKey is also avilable.
+    if (conditionKey === currentConditionKey) {
+      result.push({
+        conditionKey,
+        isAvailable: true,
+      });
+      continue;
+    }
+
+    let isAvailable = false;
+    if (!existingConditionsMemo[conditionKey]) {
+      isAvailable = true;
+    }
+    result.push({
+      conditionKey,
+      isAvailable,
+    });
+  }
+  return result;
 };

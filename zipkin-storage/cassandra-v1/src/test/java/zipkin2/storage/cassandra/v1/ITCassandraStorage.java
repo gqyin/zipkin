@@ -18,6 +18,7 @@ import com.datastax.driver.core.Session;
 import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.Uninterruptibles;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -47,7 +48,7 @@ import static zipkin2.storage.cassandra.v1.InternalForTests.writeDependencyLinks
 public class ITCassandraStorage {
 
   static CassandraStorageRule classRule() {
-    return new CassandraStorageRule("openzipkin/zipkin-cassandra:2.11.12", "test_cassandra3");
+    return new CassandraStorageRule("openzipkin/zipkin-cassandra:2.12.3", "test_cassandra3");
   }
 
   public static class ITSpanStore extends zipkin2.storage.ITSpanStore {
@@ -223,6 +224,10 @@ public class ITCassandraStorage {
 
     @Override protected Session session() {
       return backend.session;
+    }
+
+    @Override InetSocketAddress contactPoint() {
+      return backend.contactPoint();
     }
   }
 

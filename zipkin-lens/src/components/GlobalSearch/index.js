@@ -8,13 +8,17 @@ import SearchCondition from './SearchCondition';
 import ConditionDuration from './ConditionDuration';
 import ConditionLimit from './ConditionLimit';
 import ConditionName from './ConditionName';
-import ConditionAnnotationQuery from './ConditionAnnotationQuery';
+import ConditionTags from './ConditionTags';
 import ConditionLookback from './ConditionLookback';
+import GlobalDropdownMenuContainer from '../../containers/GlobalSearch/GlobalDropdownMenuContainer';
 import {
-  orderedConditionKeyList,
+  isAutocompleteKey,
+  defaultConditionValues,
+  getConditionKeyListWithAvailability,
   buildQueryParametersWithConditions,
   buildApiQueryParameters,
   extractConditionsFromQueryParameters,
+  nextInitialConditionKey,
 } from '../../util/global-search';
 
 const propTypes = {
@@ -35,8 +39,16 @@ const propTypes = {
   }).isRequired,
   limitCondition: PropTypes.number.isRequired,
   fetchServices: PropTypes.func.isRequired,
+  isLoadingServices: PropTypes.bool.isRequired,
   fetchSpans: PropTypes.func.isRequired,
+  isLoadingSpans: PropTypes.bool.isRequired,
   fetchTraces: PropTypes.func.isRequired,
+  fetchAutocompleteKeys: PropTypes.func.isRequired,
+  fetchAutocompleteValues: PropTypes.func.isRequired,
+  autocompleteKeys: PropTypes.arrayOf(PropTypes.string).isRequired,
+  isLoadingAutocompleteKeys: PropTypes.bool.isRequired,
+  autocompleteValues: PropTypes.arrayOf(PropTypes.string).isRequired,
+  isLoadingAutocompleteValues: PropTypes.bool.isRequired,
   setLookbackCondition: PropTypes.func.isRequired,
   setLimitCondition: PropTypes.func.isRequired,
   addCondition: PropTypes.func.isRequired,
@@ -54,7 +66,9 @@ const propTypes = {
 class GlobalSearch extends React.Component {
   constructor(props) {
     super(props);
-
+    this.state = {
+      isConditionFocused: false,
+    };
     this.handleAddButtonClick = this.handleAddButtonClick.bind(this);
     this.handleSearchButtonClick = this.handleSearchButtonClick.bind(this);
     this.handleDeleteConditionButtonClick = this.handleDeleteConditionButtonClick.bind(this);
@@ -62,12 +76,18 @@ class GlobalSearch extends React.Component {
     this.handleConditionValueChange = this.handleConditionValueChange.bind(this);
     this.handleLookbackChange = this.handleLookbackChange.bind(this);
     this.handleLimitChange = this.handleLimitChange.bind(this);
+    this.handleKeyDown = this.handleKeyDown.bind(this);
+    this.handleConditionFocus = this.handleConditionFocus.bind(this);
+    this.handleConditionKeyBlur = this.handleConditionKeyBlur.bind(this);
+    this.handleConditionValueBlur = this.handleConditionValueBlur.bind(this);
   }
 
   componentDidMount() {
+    document.addEventListener('keydown', this.handleKeyDown);
     const {
       fetchServices,
       fetchSpans,
+      fetchAutocompleteKeys,
       location,
       addCondition,
       setLookbackCondition,
@@ -91,6 +111,7 @@ class GlobalSearch extends React.Component {
     if (serviceNameCondition) {
       fetchSpans(serviceNameCondition.value);
     }
+    fetchAutocompleteKeys();
     this.fetchTraces(location);
   }
 
@@ -99,6 +120,10 @@ class GlobalSearch extends React.Component {
     if (location.search !== '' && location.search !== '?' && previousLocation.search !== location.search) {
       this.fetchTraces(location);
     }
+  }
+
+  componentWillUnmount() {
+    document.removeEventListener('keydown', this.handleKeyDown);
   }
 
   getConditionsFromQueryParameters() {
@@ -114,42 +139,6 @@ class GlobalSearch extends React.Component {
     };
   }
 
-  // Make the availability with the already specified condition being false,
-  // the condition not specified yet being true.
-  getConditionListWithAvailability(currentConditionKey) {
-    const { conditions } = this.props;
-    const existingConditionsMemo = {};
-
-    // Memo the keys which is already used.
-    conditions.forEach((condition) => {
-      if (condition.key === 'annotationQuery') {
-        return;
-      }
-      existingConditionsMemo[condition.key] = true;
-    });
-
-    const result = [];
-    for (let i = 0; i < orderedConditionKeyList.length; i += 1) {
-      const conditionKey = orderedConditionKeyList[i];
-
-      // The currently focused conditionName is also available.
-      if (conditionKey === currentConditionKey) {
-        result.push({ conditionKey, isAvailable: true });
-        continue;
-      }
-
-      let isAvailable = false;
-      if (!existingConditionsMemo[conditionKey]) {
-        isAvailable = true;
-      }
-      result.push({
-        conditionKey,
-        isAvailable,
-      });
-    }
-    return result;
-  }
-
   fetchTraces(location) {
     const { fetchTraces } = this.props;
     if (location.search !== '' && location.search !== '?') {
@@ -160,8 +149,19 @@ class GlobalSearch extends React.Component {
   }
 
   handleAddButtonClick() {
-    const { addCondition } = this.props;
-    addCondition();
+    const { addCondition, conditions, autocompleteKeys } = this.props;
+    const nextConditionKey = nextInitialConditionKey(conditions, autocompleteKeys);
+    addCondition({
+      key: nextConditionKey,
+      value: defaultConditionValues(nextConditionKey),
+    });
+  }
+
+  handleKeyDown(event) {
+    const { isConditionFocused } = this.state;
+    if (event.key === 'Enter' && !isConditionFocused) {
+      this.handleSearchButtonClick();
+    }
   }
 
   handleSearchButtonClick() {
@@ -182,8 +182,15 @@ class GlobalSearch extends React.Component {
 
   // Replaces the key of the "index"-th condition with "keyName" and clear value.
   handleConditionKeyChange(index, conditionKey) {
-    const { changeConditionKey } = this.props;
+    const {
+      changeConditionKey,
+      fetchAutocompleteValues,
+    } = this.props;
     changeConditionKey(index, conditionKey);
+
+    if (isAutocompleteKey(conditionKey)) {
+      fetchAutocompleteValues(conditionKey);
+    }
   }
 
   // Replaces the value of the "index"-th condition with "value".
@@ -215,17 +222,45 @@ class GlobalSearch extends React.Component {
     setLimitCondition(limitCondition);
   }
 
-  renderCondition(conditionName, index, value) {
-    const { services, spans } = this.props;
+  handleConditionFocus() {
+    this.setState({ isConditionFocused: true });
+  }
+
+  handleConditionKeyBlur() {
+    this.setState({ isConditionFocused: false });
+  }
+
+  handleConditionValueBlur() {
+    // Delay for avoiding to fetch
+    setTimeout(() => { this.setState({ isConditionFocused: false }); }, 0);
+  }
+
+  renderCondition(conditionKey, index, value) {
+    const {
+      services,
+      spans,
+      isLoadingServices,
+      isLoadingSpans,
+      autocompleteValues,
+      isLoadingAutocompleteValues,
+    } = this.props;
     const commonProps = {
       value,
       onConditionChange: (val) => { this.handleConditionValueChange(index, val); },
     };
 
-    switch (conditionName) {
+    switch (conditionKey) {
       case 'serviceName':
       case 'spanName': {
-        const options = conditionName === 'serviceName' ? services : spans;
+        let options;
+        let isLoadingOptions;
+        if (conditionKey === 'serviceName') {
+          options = services;
+          isLoadingOptions = isLoadingServices;
+        } else {
+          options = spans;
+          isLoadingOptions = isLoadingSpans;
+        }
         return ({
           onFocus, onBlur, setNextFocusRef, isFocused,
         }) => (
@@ -236,6 +271,7 @@ class GlobalSearch extends React.Component {
             onBlur={onBlur}
             setNextFocusRef={setNextFocusRef}
             isFocused={isFocused}
+            isLoadingOptions={isLoadingOptions}
           />
         );
       }
@@ -252,11 +288,11 @@ class GlobalSearch extends React.Component {
             isFocused={isFocused}
           />
         );
-      case 'annotationQuery':
+      case 'tags':
         return ({
           onFocus, onBlur, setNextFocusRef, isFocused,
         }) => (
-          <ConditionAnnotationQuery
+          <ConditionTags
             {...commonProps}
             onFocus={onFocus}
             onBlur={onBlur}
@@ -264,14 +300,77 @@ class GlobalSearch extends React.Component {
             isFocused={isFocused}
           />
         );
-      default:
-        // Do nothing
-        return null;
+      default: // autocompleteTags
+        return ({
+          onFocus, onBlur, setNextFocusRef, isFocused,
+        }) => (
+          <ConditionName
+            {...commonProps}
+            options={autocompleteValues}
+            onFocus={onFocus}
+            onBlur={onBlur}
+            setNextFocusRef={setNextFocusRef}
+            isFocused={isFocused}
+            isLoadingOptions={isLoadingAutocompleteValues}
+          />
+        );
     }
   }
 
+  renderSearchCondition(condition, index) {
+    const {
+      conditions,
+      autocompleteKeys,
+      fetchAutocompleteValues,
+    } = this.props;
+
+    const commonProps = {
+      keyString: condition.key,
+      keyOptions: getConditionKeyListWithAvailability(condition.key, conditions, autocompleteKeys),
+      onConditionKeyChange: (conditionKey) => {
+        this.handleConditionKeyChange(index, conditionKey);
+      },
+      onDeleteButtonClick: () => { this.handleDeleteConditionButtonClick(index); },
+    };
+
+    if (isAutocompleteKey(condition.key)) {
+      return (
+        <SearchCondition
+          {...commonProps}
+          onKeyFocus={() => {
+            fetchAutocompleteValues(condition.key);
+            this.handleConditionFocus();
+          }}
+          onValueFocus={() => {
+            fetchAutocompleteValues(condition.key);
+            this.handleConditionFocus();
+          }}
+          onKeyBlur={this.handleConditionKeyBlur}
+          onValueBlur={this.handleConditionValueBlur}
+        >
+          { this.renderCondition(condition.key, index, condition.value) }
+        </SearchCondition>
+      );
+    }
+    return (
+      <SearchCondition
+        {...commonProps}
+        onKeyFocus={this.handleConditionFocus}
+        onValueFocus={this.handleConditionFocus}
+        onKeyBlur={this.handleConditionKeyBlur}
+        onValueBlur={this.handleConditionValueBlur}
+      >
+        { this.renderCondition(condition.key, index, condition.value) }
+      </SearchCondition>
+    );
+  }
+
   render() {
-    const { conditions, lookbackCondition, limitCondition } = this.props;
+    const {
+      conditions,
+      lookbackCondition,
+      limitCondition,
+    } = this.props;
     return (
       <div className="global-search">
         <div className="global-search__conditions">
@@ -287,18 +386,7 @@ class GlobalSearch extends React.Component {
                   key={condition._id}
                   className="global-search__search-condition-wrapper"
                 >
-                  <SearchCondition
-                    keyString={condition.key}
-                    keyOptions={this.getConditionListWithAvailability(condition.key)}
-                    onConditionKeyChange={
-                      (keyName) => { this.handleConditionKeyChange(index, keyName); }
-                    }
-                    onDeleteButtonClick={() => { this.handleDeleteConditionButtonClick(index); }}
-                  >
-                    {
-                      this.renderCondition(condition.key, index, condition.value)
-                    }
-                  </SearchCondition>
+                  { this.renderSearchCondition(condition, index) }
                 </div>
               ))
           }
@@ -328,6 +416,9 @@ class GlobalSearch extends React.Component {
             lookback={lookbackCondition}
             onLookbackChange={this.handleLookbackChange}
           />
+        </div>
+        <div className="global-search__dropdown-menu-wrapper">
+          <GlobalDropdownMenuContainer />
         </div>
       </div>
     );

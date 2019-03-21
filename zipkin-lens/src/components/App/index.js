@@ -4,38 +4,56 @@ import { BrowserRouter, Route } from 'react-router-dom';
 
 import Layout from './Layout';
 import BrowserContainer from '../../containers/Browser/BrowserContainer';
-import DetailedTraceSummaryContainer from '../../containers/DetailedTraceSummary/DetailedTraceSummaryContainer';
+import TracePageContainer from '../../containers/TracePage/TracePageContainer';
 import DependenciesContainer from '../../containers/Dependencies/DependenciesContainer';
+import TraceViewerContainer from '../../containers/TraceViewer/TraceViewerContainer';
 import configureStore from '../../store/configure-store';
 
-const App = () => (
-  <Provider store={configureStore()}>
-    <BrowserRouter>
-      <Layout>
-        <Route
-          exact
-          path="/zipkin"
-          render={props => (
-            <BrowserContainer {...props} />
-          )}
-        />
-        <Route
-          exact
-          path="/zipkin/trace/:traceId"
-          render={props => (
-            <DetailedTraceSummaryContainer {...props} />
-          )}
-        />
-        <Route
-          exact
-          path="/zipkin/dependencies"
-          render={props => (
-            <DependenciesContainer {...props} />
-          )}
-        />
-      </Layout>
-    </BrowserRouter>
-  </Provider>
-);
+const applicationTitle = 'Zipkin';
+
+class App extends React.Component {
+  componentDidMount() {
+    document.title = applicationTitle;
+  }
+
+  render() {
+    return (
+      <Provider store={configureStore()}>
+        <BrowserRouter>
+          <Layout>
+            <Route
+              exact
+              path="/zipkin"
+              render={props => (
+                <BrowserContainer {...props} />
+              )}
+            />
+            <Route
+              exact
+              path="/zipkin/traces/:traceId"
+              render={props => (
+                <TracePageContainer {...props} />
+              )}
+            />
+            <Route
+              exact
+              path="/zipkin/dependency"
+              render={props => (
+                <DependenciesContainer {...props} />
+              )}
+            />
+            <Route
+              exact
+              path="/zipkin/traceViewer"
+              render={props => (
+                <TraceViewerContainer {...props} />
+              )}
+            />
+          </Layout>
+        </BrowserRouter>
+      </Provider>
+    );
+  }
+}
 
 export default App;

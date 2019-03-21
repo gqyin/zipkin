@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2018 The OpenZipkin Authors
+ * Copyright 2015-2019 The OpenZipkin Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License. You may obtain a copy of the License at
@@ -13,6 +13,17 @@
  */
 package zipkin2.autoconfigure.ui;
 
+import com.linecorp.armeria.common.AggregatedHttpMessage;
+import com.linecorp.armeria.common.HttpHeaderNames;
+import com.linecorp.armeria.common.HttpHeaders;
+import com.linecorp.armeria.common.HttpMethod;
+import com.linecorp.armeria.common.HttpRequest;
+import com.linecorp.armeria.common.MediaType;
+import com.linecorp.armeria.server.ServiceRequestContext;
+import io.netty.handler.codec.http.cookie.ClientCookieEncoder;
+import io.netty.handler.codec.http.cookie.Cookie;
+import io.netty.handler.codec.http.cookie.DefaultCookie;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import org.junit.After;
 import org.junit.Rule;
@@ -24,8 +35,6 @@ import org.springframework.boot.autoconfigure.context.PropertyPlaceholderAutoCon
 import org.springframework.boot.test.util.TestPropertyValues;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.core.io.ClassPathResource;
-import org.springframework.core.io.Resource;
-import org.springframework.http.MediaType;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.CoreMatchers.isA;
@@ -54,26 +63,26 @@ public class ZipkinUiAutoConfigurationTest {
   }
 
   @Test
-  public void indexContentType() throws IOException {
+  public void indexContentType() {
     context = createContext();
     assertThat(
-      context.getBean(ZipkinUiAutoConfiguration.class).serveIndex().getHeaders().getContentType())
-      .isEqualTo(MediaType.TEXT_HTML);
+      serveIndex().headers().contentType())
+      .isEqualTo(MediaType.HTML_UTF_8);
   }
 
   @Test
-  public void invalidIndexHtml() throws IOException {
+  public void invalidIndexHtml() {
     // I failed to make Jsoup barf, even on nonsense like: "<head wait no I changed my mind this HTML is totally invalid <<<<<<<<<<<"
     // So let's just run with a case where the file doesn't exist
     context = createContextWithOverridenProperty("zipkin.ui.basepath:/foo/bar");
     ZipkinUiAutoConfiguration ui = context.getBean(ZipkinUiAutoConfiguration.class);
     ui.indexHtml = new ClassPathResource("does-not-exist.html");
 
-    thrown.expect(BeanCreationException.class);
+    thrown.expect(RuntimeException.class);
     // There's a BeanInstantiationException nested in between BeanCreationException and IOException,
     // so we go one level deeper about causes. There's no `expectRootCause`.
-    thrown.expectCause(hasCause(isA(IOException.class)));
-    ui.serveIndex();
+    thrown.expectCause(hasCause(hasCause(isA(BeanCreationException.class))));
+    serveIndex();
   }
 
   @Test
@@ -139,35 +148,49 @@ public class ZipkinUiAutoConfigurationTest {
   @Test
   public void defaultBaseUrl_doesNotChangeResource() throws IOException {
     context = createContext();
-    Resource index =
-      (Resource) context.getBean(ZipkinUiAutoConfiguration.class).serveIndex().getBody();
 
-    assertThat(index.getInputStream())
+    assertThat(new ByteArrayInputStream(serveIndex().content().array()))
       .hasSameContentAs(getClass().getResourceAsStream("/zipkin-ui/index.html"));
   }
 
   @Test
-  public void canOverideProperty_basePath() throws IOException {
+  public void canOverideProperty_basePath() {
     context = createContextWithOverridenProperty("zipkin.ui.basepath:/foo/bar");
 
-    assertThat(context.getBean(ZipkinUiAutoConfiguration.class).serveIndex().getBody().toString())
+    assertThat(serveIndex().contentUtf8())
       .contains("<base href=\"/foo/bar/\">");
   }
 
   @Test
-  public void canOverideProperty_sourceRoot() throws IOException {
-    context = createContextWithOverridenProperty("zipkin.ui.source-root:classpath:zipkin-lens");
+  public void lensCookieOverridesIndex() {
+    context = createContext();
 
-    assertThat(context.getBean(ZipkinUiAutoConfiguration.class).indexHtml.getDescription())
+    assertThat(serveIndex(new DefaultCookie("lens", "true")).contentUtf8())
       .contains("zipkin-lens");
   }
 
   @Test
-  public void canOverideProperty_specialCaseRoot() throws IOException {
+  public void canOverideProperty_specialCaseRoot() {
     context = createContextWithOverridenProperty("zipkin.ui.basepath:/");
 
-    assertThat(context.getBean(ZipkinUiAutoConfiguration.class).serveIndex().getBody().toString())
+    assertThat(serveIndex().contentUtf8())
       .contains("<base href=\"/\">");
+  }
+
+  private AggregatedHttpMessage serveIndex(Cookie... cookies) {
+    HttpHeaders headers = HttpHeaders.of(HttpMethod.GET, "/");
+    String encodedCookies = ClientCookieEncoder.LAX.encode(cookies);
+    if (encodedCookies != null) {
+      headers.set(HttpHeaderNames.COOKIE, encodedCookies);
+    }
+    HttpRequest req = HttpRequest.of(headers);
+    try {
+      return context.getBean(ZipkinUiAutoConfiguration.class).indexSwitchingService()
+        .serve(ServiceRequestContext.of(req), req).aggregate()
+        .get();
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
   }
 
   private static AnnotationConfigApplicationContext createContext() {

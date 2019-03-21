@@ -49,7 +49,8 @@ final class CassandraSpanConsumer implements SpanConsumer {
     insertTrace = new InsertTrace.Factory(session, metadata, spanTtl);
     insertServiceName = new InsertServiceName.Factory(storage, indexTtl);
     insertSpanName = new InsertSpanName.Factory(storage, indexTtl);
-    insertAutocompleteValue = new InsertAutocompleteValue.Factory(storage, indexTtl);
+    insertAutocompleteValue = !storage.autocompleteKeys.isEmpty()
+      ? new InsertAutocompleteValue.Factory(storage, indexTtl) : null;
     indexer = new CompositeIndexer(session, indexCacheSpec, storage.bucketCount, indexTtl);
     autocompleteKeys = new LinkedHashSet<>(storage.autocompleteKeys);
   }
@@ -113,8 +114,8 @@ final class CassandraSpanConsumer implements SpanConsumer {
   void clear() {
     insertServiceName.clear();
     insertSpanName.clear();
-    insertAutocompleteValue.clear();
     indexer.clear();
+    if (insertAutocompleteValue != null) insertAutocompleteValue.clear();
   }
 
   private static long guessTimestamp(Span span) {

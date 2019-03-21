@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2018 The OpenZipkin Authors
+ * Copyright 2015-2019 The OpenZipkin Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License. You may obtain a copy of the License at
@@ -13,11 +13,30 @@
  */
 package zipkin2.autoconfigure.ui;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.linecorp.armeria.common.HttpData;
+import com.linecorp.armeria.common.HttpHeaderNames;
+import com.linecorp.armeria.common.HttpRequest;
+import com.linecorp.armeria.common.HttpResponse;
+import com.linecorp.armeria.common.HttpStatus;
+import com.linecorp.armeria.common.MediaType;
+import com.linecorp.armeria.server.AbstractHttpService;
+import com.linecorp.armeria.server.HttpService;
+import com.linecorp.armeria.server.RedirectService;
+import com.linecorp.armeria.server.ServerCacheControl;
+import com.linecorp.armeria.server.ServerCacheControlBuilder;
+import com.linecorp.armeria.server.Service;
+import com.linecorp.armeria.server.ServiceRequestContext;
+import com.linecorp.armeria.server.file.HttpFileBuilder;
+import com.linecorp.armeria.server.file.HttpFileServiceBuilder;
+import com.linecorp.armeria.spring.ArmeriaServerConfigurator;
+import io.netty.handler.codec.http.cookie.Cookie;
+import io.netty.handler.codec.http.cookie.ServerCookieDecoder;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -28,19 +47,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.core.io.Resource;
-import org.springframework.http.CacheControl;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.servlet.ModelAndView;
-import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry;
-import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
-import static org.springframework.web.bind.annotation.RequestMethod.GET;
-import static org.springframework.web.servlet.HandlerMapping.PATH_WITHIN_HANDLER_MAPPING_ATTRIBUTE;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static zipkin2.autoconfigure.ui.ZipkinUiProperties.DEFAULT_BASEPATH;
 
 /**
@@ -68,22 +76,30 @@ import static zipkin2.autoconfigure.ui.ZipkinUiProperties.DEFAULT_BASEPATH;
 @Configuration
 @EnableConfigurationProperties(ZipkinUiProperties.class)
 @ConditionalOnProperty(name = "zipkin.ui.enabled", matchIfMissing = true)
-@RestController
 class ZipkinUiAutoConfiguration {
-
   @Autowired
   ZipkinUiProperties ui;
 
-  @Value("${zipkin.ui.source-root:classpath:zipkin-ui}/index.html")
+  @Value("classpath:zipkin-ui/index.html")
   Resource indexHtml;
+  @Value("classpath:zipkin-lens/index.html")
+  Resource lensIndexHtml;
 
-  @Bean
-  @Lazy
-  String processedIndexHtml() throws IOException {
+  @Bean @Lazy String processedIndexHtml() {
+    return processedIndexHtml(indexHtml);
+  }
+
+  @Bean @Lazy String processedLensIndexHtml() {
+    return processedIndexHtml(lensIndexHtml);
+  }
+
+  String processedIndexHtml(Resource indexHtml) {
     String baseTagValue = "/".equals(ui.getBasepath()) ? "/" : ui.getBasepath() + "/";
     Document soup;
     try (InputStream is = indexHtml.getInputStream()) {
       soup = Jsoup.parse(is, null, baseTagValue);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e); // unexpected
     }
     if (soup.head().getElementsByTag("base").isEmpty()) {
       soup.head().appendChild(
@@ -94,66 +110,81 @@ class ZipkinUiAutoConfiguration {
     return soup.html();
   }
 
-  @Bean
-  public WebMvcConfigurer resourceConfigurer(@Value("${zipkin.ui.source-root:classpath:zipkin-ui}") String sourceRoot) {
-    return new WebMvcConfigurer() {
-      @Override
-      public void addResourceHandlers(ResourceHandlerRegistry registry) {
-        registry.addResourceHandler("/zipkin/**")
-          .addResourceLocations(sourceRoot + "/")
-          .setCachePeriod((int) TimeUnit.DAYS.toSeconds(365));      }
-    };
+  @Bean @Lazy IndexSwitchingService indexSwitchingService() {
+    final HttpFileBuilder legacyIndex;
+    final HttpFileBuilder lensIndex;
+    if (DEFAULT_BASEPATH.equals(ui.getBasepath())) {
+      legacyIndex = HttpFileBuilder.ofResource("zipkin-ui/index.html");
+      lensIndex = HttpFileBuilder.ofResource("zipkin-lens/index.html");
+    } else {
+      legacyIndex = HttpFileBuilder.of(HttpData.of(processedIndexHtml().getBytes(UTF_8)));
+      lensIndex = HttpFileBuilder.of(HttpData.of(processedLensIndexHtml().getBytes(UTF_8)));
+    }
+
+    ServerCacheControl maxAgeMinute = new ServerCacheControlBuilder().maxAgeSeconds(60).build();
+    legacyIndex.contentType(MediaType.HTML_UTF_8).cacheControl(maxAgeMinute);
+    lensIndex.contentType(MediaType.HTML_UTF_8).cacheControl(maxAgeMinute);
+
+    // In both our old and new UI, assets have hashes in the filenames (generated by webpack).
+    // This allows us to host both simultaneously without conflict as long as we change the index
+    // file to point to the correct files.
+    return new IndexSwitchingService(
+      legacyIndex.build().asService(), lensIndex.build().asService());
   }
 
-  @RequestMapping(value = "/zipkin/config.json", method = GET)
-  public ResponseEntity<ZipkinUiProperties> serveUiConfig() {
-    return ResponseEntity.ok()
-        .cacheControl(CacheControl.maxAge(10, TimeUnit.MINUTES))
-        .contentType(MediaType.APPLICATION_JSON)
-        .body(ui);
+  @Bean @Lazy ArmeriaServerConfigurator uiServerConfigurator(
+    IndexSwitchingService indexSwitchingService) throws IOException {
+    ServerCacheControl maxAgeYear =
+      new ServerCacheControlBuilder().maxAgeSeconds(TimeUnit.DAYS.toSeconds(365)).build();
+    Service<HttpRequest, HttpResponse> uiFileService =
+      HttpFileServiceBuilder.forClassPath("zipkin-ui").cacheControl(maxAgeYear).build()
+        .orElse(HttpFileServiceBuilder.forClassPath("zipkin-lens").cacheControl(maxAgeYear).build());
+
+    byte[] config = new ObjectMapper().writeValueAsBytes(ui);
+
+    return sb -> sb
+      .service("/zipkin/config.json", HttpFileBuilder.of(HttpData.of(config))
+        .cacheControl(new ServerCacheControlBuilder().maxAgeSeconds(600).build())
+        .contentType(MediaType.JSON_UTF_8)
+        .build()
+        .asService())
+      .service("/zipkin/index.html", indexSwitchingService)
+
+      // TODO This approach requires maintenance when new UI routes are added. Change to the following:
+      // If the path is a a file w/an extension, treat normally.
+      // Otherwise instead of returning 404, forward to the index.
+      // See https://github.com/twitter/finatra/blob/458c6b639c3afb4e29873d123125eeeb2b02e2cd/http/src/main/scala/com/twitter/finatra/http/response/ResponseBuilder.scala#L321
+      .service("/zipkin/", indexSwitchingService)
+      .service("/zipkin/traces/{id}", indexSwitchingService)
+      .service("/zipkin/dependency", indexSwitchingService)
+      .service("/zipkin/traceViewer", indexSwitchingService)
+
+      .service("/favicon.ico", new RedirectService(HttpStatus.FOUND, "/zipkin/favicon.ico"))
+      .service("/", new RedirectService(HttpStatus.FOUND, "/zipkin/"))
+      .service("/zipkin", new RedirectService(HttpStatus.FOUND, "/zipkin/"))
+      .serviceUnder("/zipkin/", uiFileService);
   }
 
-  @RequestMapping(value = "/zipkin/index.html", method = GET)
-  public ResponseEntity<?> serveIndex() throws IOException {
-    ResponseEntity.BodyBuilder result = ResponseEntity.ok()
-      .cacheControl(CacheControl.maxAge(1, TimeUnit.MINUTES))
-      .contentType(MediaType.TEXT_HTML);
-    return DEFAULT_BASEPATH.equals(ui.getBasepath())
-      ? result.body(indexHtml)
-      : result.body(processedIndexHtml());
-  }
+  static class IndexSwitchingService extends AbstractHttpService {
+    final HttpService legacyIndex;
+    final HttpService lensIndex;
 
-  /**
-   * This cherry-picks well-known routes the single-page app serves, and forwards to that as opposed
-   * to returning a 404.
-   */
-  // TODO This approach requires maintenance when new UI routes are added. Change to the following:
-  // If the path is a a file w/an extension, treat normally.
-  // Otherwise instead of returning 404, forward to the index.
-  // See https://github.com/twitter/finatra/blob/458c6b639c3afb4e29873d123125eeeb2b02e2cd/http/src/main/scala/com/twitter/finatra/http/response/ResponseBuilder.scala#L321
-  @RequestMapping(value = {"/zipkin/", "/zipkin/traces/{id}", "/zipkin/dependency", "/zipkin/traceViewer"}, method = GET)
-  public ModelAndView forwardUiEndpoints() {
-    return new ModelAndView("forward:/zipkin/index.html");
-  }
+    IndexSwitchingService(HttpService legacyIndex, HttpService lensIndex) {
+      this.legacyIndex = legacyIndex;
+      this.lensIndex = lensIndex;
+    }
 
-  /** The UI looks for the api relative to where it is mounted, under /zipkin */
-  @RequestMapping(value = "/zipkin/api/**", method = GET)
-  public ModelAndView forwardApi(HttpServletRequest request) {
-    String path = (String) request.getAttribute(PATH_WITHIN_HANDLER_MAPPING_ATTRIBUTE);
-    return new ModelAndView("forward:" + path.replaceFirst("/zipkin", ""));
-  }
-
-  /** Borrow favicon from UI assets under /zipkin */
-  @RequestMapping(value = "/favicon.ico", method = GET)
-  public ModelAndView favicon() {
-    return new ModelAndView("forward:/zipkin/favicon.ico");
-  }
-
-  /** Make sure users who aren't familiar with /zipkin get to the right path */
-  @RequestMapping(value = "/", method = GET)
-  public void redirectRoot(HttpServletResponse response) {
-    // return 'Location: ./zipkin/' header (this wouldn't work with ModelAndView's 'redirect:./zipkin/')
-    response.setHeader(HttpHeaders.LOCATION, "./zipkin/");
-    response.setStatus(HttpStatus.FOUND.value());
+    @Override
+    public HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req)
+      throws Exception {
+      Set<Cookie> cookies = ServerCookieDecoder.LAX.decode(
+        req.headers().get(HttpHeaderNames.COOKIE, ""));
+      for (Cookie cookie : cookies) {
+        if (cookie.name().equals("lens") && Boolean.parseBoolean(cookie.value())) {
+          return lensIndex.serve(ctx, req);
+        }
+      }
+      return legacyIndex.serve(ctx, req);
+    }
   }
 }

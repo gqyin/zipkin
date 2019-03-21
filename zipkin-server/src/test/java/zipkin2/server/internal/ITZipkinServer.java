@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2018 The OpenZipkin Authors
+ * Copyright 2015-2019 The OpenZipkin Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License. You may obtain a copy of the License at
@@ -13,8 +13,8 @@
  */
 package zipkin2.server.internal;
 
+import com.linecorp.armeria.server.Server;
 import java.io.IOException;
-import java.util.Arrays;
 import java.util.List;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
@@ -27,7 +27,6 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.junit4.SpringRunner;
 import zipkin.server.ZipkinServer;
@@ -37,6 +36,7 @@ import zipkin2.TestObjects;
 import zipkin2.codec.SpanBytesEncoder;
 import zipkin2.storage.InMemoryStorage;
 
+import static java.util.Arrays.asList;
 import static org.assertj.core.api.Assertions.assertThat;
 import static zipkin2.TestObjects.TODAY;
 import static zipkin2.TestObjects.UTF_8;
@@ -48,10 +48,10 @@ import static zipkin2.TestObjects.UTF_8;
 )
 @RunWith(SpringRunner.class)
 public class ITZipkinServer {
-  static final List<Span> TRACE = Arrays.asList(TestObjects.CLIENT_SPAN);
+  static final List<Span> TRACE = asList(TestObjects.CLIENT_SPAN);
 
   @Autowired InMemoryStorage storage;
-  @Value("${local.server.port}") int zipkinPort;
+  @Autowired Server server;
 
   OkHttpClient client = new OkHttpClient.Builder().followRedirects(true).build();
 
@@ -98,14 +98,41 @@ public class ITZipkinServer {
     Response response = post("/api/v2/spans", body);
     assertThat(response.code()).isEqualTo(400);
     assertThat(response.body().string())
-      .startsWith("Malformed reading List<Span> from json");
+      .startsWith("Expected a JSON_V2 encoded list\n");
+  }
+
+  @Test public void writeSpans_incorrectJsonFormatIsBadRequest_v1_v2() throws Exception {
+    byte[] message = SpanBytesEncoder.JSON_V1.encodeList(TRACE);
+
+    Response response = post("/api/v2/spans", message);
+    assertThat(response.code()).isEqualTo(400);
+    assertThat(response.body().string())
+      .startsWith("Expected a JSON_V2 encoded list, but received: JSON_V1\n");
+  }
+
+  @Test public void writeSpans_incorrectJsonFormatIsBadRequest_v2_v1() throws Exception {
+    byte[] message = SpanBytesEncoder.JSON_V2.encodeList(TRACE);
+
+    Response response = post("/api/v1/spans", message);
+    assertThat(response.code()).isEqualTo(400);
+    assertThat(response.body().string())
+      .startsWith("Expected a JSON_V1 encoded list, but received: JSON_V2\n");
+  }
+
+  @Test public void writeSpans_ambiguousFormatOk() throws Exception {
+    byte[] message = SpanBytesEncoder.JSON_V2.encodeList(asList(
+      Span.newBuilder().traceId("1").id("1").name("test").build()
+    ));
+
+    assertThat(post("/api/v1/spans", message).code()).isEqualTo(202);
+    assertThat(post("/api/v2/spans", message).code()).isEqualTo(202);
   }
 
   @Test public void writeSpans_malformedGzipIsBadRequest() throws Exception {
     byte[] body = {'h', 'e', 'l', 'l', 'o'};
 
     Response response = client.newCall(new Request.Builder()
-      .url("http://localhost:" + zipkinPort + "/api/v2/spans")
+      .url(url(server, "/api/v2/spans"))
       .header("Content-Encoding", "gzip") // << gzip here, but the body isn't!
       .post(RequestBody.create(null, body))
       .build()).execute();
@@ -119,11 +146,12 @@ public class ITZipkinServer {
     byte[] message = SpanBytesEncoder.THRIFT.encodeList(TRACE);
 
     Response response = client.newCall(new Request.Builder()
-      .url("http://localhost:" + zipkinPort + "/api/v1/spans")
+      .url(url(server, "/api/v1/spans"))
       .post(RequestBody.create(MediaType.parse("application/x-thrift"), message))
       .build()).execute();
 
     assertThat(response.code())
+      .withFailMessage(response.body().string())
       .isEqualTo(202);
   }
 
@@ -131,20 +159,20 @@ public class ITZipkinServer {
     byte[] body = {'h', 'e', 'l', 'l', 'o'};
 
     Response response = client.newCall(new Request.Builder()
-      .url("http://localhost:" + zipkinPort + "/api/v1/spans")
+      .url(url(server, "/api/v1/spans"))
       .post(RequestBody.create(MediaType.parse("application/x-thrift"), body))
       .build()).execute();
 
     assertThat(response.code()).isEqualTo(400);
     assertThat(response.body().string())
-      .endsWith("reading List<Span> from TBinary");
+      .endsWith("Expected a THRIFT encoded list\n");
   }
 
   @Test public void writeSpans_contentTypeXProtobuf() throws Exception {
     byte[] message = SpanBytesEncoder.PROTO3.encodeList(TRACE);
 
     Response response = client.newCall(new Request.Builder()
-      .url("http://localhost:" + zipkinPort + "/api/v2/spans")
+      .url(url(server, "/api/v2/spans"))
       .post(RequestBody.create(MediaType.parse("application/x-protobuf"), message))
       .build()).execute();
 
@@ -156,13 +184,13 @@ public class ITZipkinServer {
     byte[] body = {'h', 'e', 'l', 'l', 'o'};
 
     Response response = client.newCall(new Request.Builder()
-      .url("http://localhost:" + zipkinPort + "/api/v2/spans")
+      .url(url(server, "/api/v2/spans"))
       .post(RequestBody.create(MediaType.parse("application/x-protobuf"), body))
       .build()).execute();
 
     assertThat(response.code()).isEqualTo(400);
     assertThat(response.body().string())
-      .startsWith("Truncated: length 101 > bytes remaining 3 reading List<Span> from proto3");
+      .startsWith("Expected a PROTO3 encoded list\n");
   }
 
   @Test public void v2WiresUp() throws Exception {
@@ -180,7 +208,7 @@ public class ITZipkinServer {
     byte[] gzippedBody = sink.readByteArray();
 
     Response response = client.newCall(new Request.Builder()
-      .url("http://localhost:" + zipkinPort + "/api/v2/spans")
+      .url(url(server, "/api/v2/spans"))
       .header("Content-Encoding", "gzip")
       .post(RequestBody.create(null, gzippedBody))
       .build()).execute();
@@ -199,10 +227,15 @@ public class ITZipkinServer {
       .isNull();
   }
 
+  @Test public void spanNameQueryWorksWithNonAsciiServiceName() throws Exception {
+    assertThat(get("/api/v2/spans?serviceName=个人信息服务").code())
+      .isEqualTo(200);
+  }
+
   @Test public void setsCacheControlOnNameEndpointsWhenMoreThan3Services() throws Exception {
-    List<String> services = Arrays.asList("foo", "bar", "baz", "quz");
+    List<String> services = asList("foo", "bar", "baz", "quz");
     for (int i = 0; i < services.size(); i++) {
-      post("/api/v2/spans", SpanBytesEncoder.JSON_V2.encodeList(Arrays.asList(
+      post("/api/v2/spans", SpanBytesEncoder.JSON_V2.encodeList(asList(
         Span.newBuilder().traceId("a").id(i + 1).timestamp(TODAY).name("whopper").localEndpoint(
           Endpoint.newBuilder().serviceName(services.get(i)).build()
         ).build()
@@ -214,16 +247,20 @@ public class ITZipkinServer {
 
     assertThat(get("/api/v2/spans?serviceName=web").header("Cache-Control"))
       .isEqualTo("max-age=300, must-revalidate");
+
+    // Check that the response is alphabetically sorted.
+    assertThat(get("/api/v2/services").body().string())
+      .isEqualTo("[\"bar\",\"baz\",\"foo\",\"quz\"]");
   }
 
   @Test public void shouldAllowAnyOriginByDefault() throws Exception {
     Response response = client.newCall(new Request.Builder()
-      .url("http://localhost:" + zipkinPort + "/api/v2/traces")
+      .url(url(server, "/api/v2/traces"))
       .header("Origin", "http://foo.example.com")
       .build()).execute();
 
     assertThat(response.isSuccessful()).isTrue();
-    assertThat(response.header("vary")).contains("origin");
+    assertThat(response.header("vary")).isNull();
     assertThat(response.header("access-control-allow-credentials")).isNull();
     assertThat(response.header("access-control-allow-origin")).contains("*");
   }
@@ -236,7 +273,7 @@ public class ITZipkinServer {
   /** Simulate a proxy which forwards / to zipkin as opposed to resolving / -> /zipkin first */
   @Test public void redirectedHeaderUsesOriginalHostAndPort() throws Exception {
     Request forwarded = new Request.Builder()
-      .url("http://localhost:" + zipkinPort + "/")
+      .url(url(server, "/"))
       .addHeader("Host", "zipkin.com")
       .addHeader("X-Forwarded-Proto", "https")
       .addHeader("X-Forwarded-Port", "444")
@@ -247,7 +284,7 @@ public class ITZipkinServer {
 
     // Redirect header should be the proxy, not the backed IP/port
     assertThat(response.header("Location"))
-      .isEqualTo("./zipkin/");
+      .isEqualTo("/zipkin/");
   }
 
   @Test public void infoEndpointIsAvailable() throws IOException {
@@ -256,14 +293,18 @@ public class ITZipkinServer {
 
   private Response get(String path) throws IOException {
     return client.newCall(new Request.Builder()
-      .url("http://localhost:" + zipkinPort + path)
+      .url(url(server, path))
       .build()).execute();
   }
 
   private Response post(String path, byte[] body) throws IOException {
     return client.newCall(new Request.Builder()
-      .url("http://localhost:" + zipkinPort + path)
+      .url(url(server, path))
       .post(RequestBody.create(null, body))
       .build()).execute();
+  }
+
+  public static String url(Server server, String path) {
+    return "http://localhost:" + server.activePort().get().localAddress().getPort() + path;
   }
 }
